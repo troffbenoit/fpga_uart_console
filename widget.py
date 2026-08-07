@@ -19,6 +19,9 @@ class Widget(QWidget):
         for port in list_ports.comports():
             self.ui.portComboBox.addItem(port.device)
 
+            if port.device == "/dev/ttyUSB1":
+                self.ui.portComboBox.setCurrentText(port.device)
+
         self.ui.pushButton.clicked.connect(self.test_fpga)
 
     def test_fpga(self):
