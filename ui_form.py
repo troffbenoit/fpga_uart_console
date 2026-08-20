@@ -26,40 +26,60 @@ class Ui_Widget(object):
         font = QFont()
         font.setPointSize(14)
         Widget.setFont(font)
-        self.widget = QWidget(Widget)
-        self.widget.setObjectName(u"widget")
-        self.widget.setGeometry(QRect(230, 280, 241, 74))
-        self.verticalLayout = QVBoxLayout(self.widget)
+        self.layoutWidget = QWidget(Widget)
+        self.layoutWidget.setObjectName(u"layoutWidget")
+        self.layoutWidget.setGeometry(QRect(230, 280, 241, 74))
+        self.verticalLayout = QVBoxLayout(self.layoutWidget)
         self.verticalLayout.setSpacing(12)
         self.verticalLayout.setObjectName(u"verticalLayout")
         self.verticalLayout.setContentsMargins(0, 0, 0, 0)
-        self.pushButton = QPushButton(self.widget)
+        self.pushButton = QPushButton(self.layoutWidget)
         self.pushButton.setObjectName(u"pushButton")
 
         self.verticalLayout.addWidget(self.pushButton)
 
-        self.label = QLabel(self.widget)
+        self.label = QLabel(self.layoutWidget)
         self.label.setObjectName(u"label")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.verticalLayout.addWidget(self.label)
 
-        self.widget1 = QWidget(Widget)
-        self.widget1.setObjectName(u"widget1")
-        self.widget1.setGeometry(QRect(60, 150, 306, 36))
-        self.horizontalLayout = QHBoxLayout(self.widget1)
+        self.addressSectionWidget = QWidget(Widget)
+        self.addressSectionWidget.setObjectName(u"addressSectionWidget")
+        self.addressSectionWidget.setGeometry(QRect(60, 150, 306, 36))
+        self.horizontalLayout = QHBoxLayout(self.addressSectionWidget)
         self.horizontalLayout.setObjectName(u"horizontalLayout")
         self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
-        self.portLabel = QLabel(self.widget1)
+        self.portLabel = QLabel(self.addressSectionWidget)
         self.portLabel.setObjectName(u"portLabel")
 
         self.horizontalLayout.addWidget(self.portLabel)
 
-        self.portComboBox = QComboBox(self.widget1)
+        self.portComboBox = QComboBox(self.addressSectionWidget)
         self.portComboBox.setObjectName(u"portComboBox")
         self.portComboBox.setMinimumSize(QSize(200, 0))
 
         self.horizontalLayout.addWidget(self.portComboBox)
+
+        self.widget = QWidget(Widget)
+        self.widget.setObjectName(u"widget")
+        self.widget.setGeometry(QRect(70, 430, 140, 35))
+        self.addressLayout = QHBoxLayout(self.widget)
+        self.addressLayout.setObjectName(u"addressLayout")
+        self.addressLayout.setContentsMargins(0, 0, 0, 0)
+        self.AddressLabel = QLabel(self.widget)
+        self.AddressLabel.setObjectName(u"AddressLabel")
+
+        self.addressLayout.addWidget(self.AddressLabel)
+
+        self.addressValueLabel = QLabel(self.widget)
+        self.addressValueLabel.setObjectName(u"addressValueLabel")
+        font1 = QFont()
+        font1.setPointSize(18)
+        font1.setBold(True)
+        self.addressValueLabel.setFont(font1)
+
+        self.addressLayout.addWidget(self.addressValueLabel)
 
 
         self.retranslateUi(Widget)
@@ -72,5 +92,7 @@ class Ui_Widget(object):
         self.pushButton.setText(QCoreApplication.translate("Widget", u"Test FPGA", None))
         self.label.setText(QCoreApplication.translate("Widget", u"FPGA: Disconnected", None))
         self.portLabel.setText(QCoreApplication.translate("Widget", u"Serial Port:", None))
+        self.AddressLabel.setText(QCoreApplication.translate("Widget", u"Address:", None))
+        self.addressValueLabel.setText(QCoreApplication.translate("Widget", u"0000", None))
     # retranslateUi
 
