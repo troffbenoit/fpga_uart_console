@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import sys
+import signal
 from datetime import datetime
+from pathlib import Path
 from PySide6.QtCore import QIODevice, QTimer
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication,QComboBox,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QLineEdit,QMainWindow,QPushButton,QPlainTextEdit,QSplitter,QVBoxLayout,QWidget
+from PySide6.QtWidgets import QApplication,QComboBox,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QLineEdit,QMainWindow,QPushButton,QPlainTextEdit,QSplitter,QVBoxLayout,QWidget,QListWidget
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 def hex_bytes(data: bytes) -> str:
@@ -26,6 +28,12 @@ class FPGAConsole(QMainWindow):
         self.serial=QSerialPort(self)
         self.serial.readyRead.connect(self.read_serial)
         self.serial.errorOccurred.connect(self.serial_error)
+
+        self.project_root = Path(__file__).resolve().parent.parent
+        self.log_dir = Path.home() / 'Documents' / 'Logs'
+        self.log_file = None
+        self.log_path = None
+
         self.build_ui(); self.refresh_ports()
         idx=self.port_combo.findText('/dev/ttyUSB2')
         if idx>=0: self.port_combo.setCurrentIndex(idx)
@@ -34,13 +42,71 @@ class FPGAConsole(QMainWindow):
     def build_ui(self):
         central=QWidget(); self.setCentralWidget(central); root=QVBoxLayout(central)
         connection=QGroupBox('Serial Connection'); grid=QGridLayout(connection)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(5, 1)
         self.port_combo=QComboBox(); self.port_combo.setEditable(True)
-        self.baud_combo=QComboBox(); self.baud_combo.addItems(['9600','19200','38400','57600','115200','230400','460800','921600']); self.baud_combo.setCurrentText('115200')
+
+        self.baud_combo=QComboBox()
+        self.baud_combo.addItems(['1200','2400','4800','9600','19200','38400','57600','115200','230400','460800','921600'])
+        self.baud_combo.setEditable(True)
+        self.baud_combo.setCurrentText('115200')
+
+        self.data_bits_combo=QComboBox()
+        self.data_bits_combo.addItem('5', QSerialPort.Data5)
+        self.data_bits_combo.addItem('6', QSerialPort.Data6)
+        self.data_bits_combo.addItem('7', QSerialPort.Data7)
+        self.data_bits_combo.addItem('8', QSerialPort.Data8)
+        self.data_bits_combo.setCurrentText('8')
+
+        self.parity_combo=QComboBox()
+        self.parity_combo.addItem('None', QSerialPort.NoParity)
+        self.parity_combo.addItem('Even', QSerialPort.EvenParity)
+        self.parity_combo.addItem('Odd', QSerialPort.OddParity)
+        self.parity_combo.addItem('Mark', QSerialPort.MarkParity)
+        self.parity_combo.addItem('Space', QSerialPort.SpaceParity)
+        self.parity_combo.setCurrentText('None')
+
+        self.stop_bits_combo=QComboBox()
+        self.stop_bits_combo.addItem('1', QSerialPort.OneStop)
+        self.stop_bits_combo.addItem('1.5', QSerialPort.OneAndHalfStop)
+        self.stop_bits_combo.addItem('2', QSerialPort.TwoStop)
+        self.stop_bits_combo.setCurrentText('1')
+
+        self.flow_combo=QComboBox()
+        self.flow_combo.addItem('None', QSerialPort.NoFlowControl)
+        self.flow_combo.addItem('Hardware RTS/CTS', QSerialPort.HardwareControl)
+        self.flow_combo.addItem('Software XON/XOFF', QSerialPort.SoftwareControl)
+        self.flow_combo.setCurrentText('None')
+
         self.connect_btn=QPushButton('Connect'); self.connect_btn.clicked.connect(self.toggle_connection)
         self.refresh_btn=QPushButton('Refresh'); self.refresh_btn.clicked.connect(self.refresh_ports)
         self.status=QLabel('Disconnected')
-        grid.addWidget(QLabel('Port:'),0,0); grid.addWidget(self.port_combo,0,1); grid.addWidget(QLabel('Baud:'),0,2); grid.addWidget(self.baud_combo,0,3); grid.addWidget(self.connect_btn,0,4); grid.addWidget(self.refresh_btn,0,5); grid.addWidget(self.status,1,0,1,6)
+
+        grid.addWidget(QLabel('Port:'),0,0); grid.addWidget(self.port_combo,0,1)
+        grid.addWidget(QLabel('Baud:'),0,2); grid.addWidget(self.baud_combo,0,3)
+        grid.addWidget(QLabel('Data Bits:'),0,4); grid.addWidget(self.data_bits_combo,0,5)
+        grid.addWidget(QLabel('Parity:'),1,0); grid.addWidget(self.parity_combo,1,1)
+        grid.addWidget(QLabel('Stop Bits:'),1,2); grid.addWidget(self.stop_bits_combo,1,3)
+        grid.addWidget(QLabel('Flow Control:'),1,4); grid.addWidget(self.flow_combo,1,5)
+        grid.addWidget(self.connect_btn,2,0,1,2)
+        grid.addWidget(self.refresh_btn,2,2,1,2)
+        grid.addWidget(self.status,2,4,1,2)
         root.addWidget(connection)
+
+        session=QGroupBox('Session Logging'); session_layout=QHBoxLayout(session)
+        self.start_session_btn=QPushButton('Start Session')
+        self.stop_session_btn=QPushButton('Stop Session')
+        self.stop_session_btn.setEnabled(False)
+        self.session_status=QLabel('No active session')
+        self.start_session_btn.clicked.connect(self.start_session)
+        self.stop_session_btn.clicked.connect(self.stop_session)
+        session_layout.addWidget(self.start_session_btn)
+        session_layout.addWidget(self.stop_session_btn)
+        session_layout.addWidget(self.session_status,1)
+        root.addWidget(session)
 
         splitter=QSplitter()
         text_group=QGroupBox('Plain Text'); text_layout=QVBoxLayout(text_group)
@@ -59,7 +125,59 @@ class FPGAConsole(QMainWindow):
         send_layout.addWidget(self.send_edit,1); send_layout.addWidget(QLabel('Ending:')); send_layout.addWidget(self.ending_combo); send_layout.addWidget(self.send_btn); send_layout.addWidget(self.clear_btn)
         root.addWidget(send_group)
 
-    def timestamp(self): return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        history_group=QGroupBox('Command History')
+        history_layout=QVBoxLayout(history_group)
+        self.command_history=QListWidget()
+        history_layout.addWidget(self.command_history)
+        root.addWidget(history_group)
+
+    def timestamp(self):
+        return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+    def session_timestamp(self):
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+    def log_event(self, kind, text):
+        if self.log_file is None:
+            return
+        safe_text = text.replace('\r', r'\r').replace('\n', r'\n')
+        self.log_file.write(f'[{self.session_timestamp()}] {kind:<8} {safe_text}\n')
+        self.log_file.flush()
+
+    def start_session(self):
+        if self.log_file is not None:
+            return
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_path = self.log_dir / f'fpga_uart_session_{stamp}.log'
+        self.log_file = self.log_path.open('w', encoding='utf-8', buffering=1)
+        self.log_event('SESSION', 'START')
+        self.log_event(
+            'CONFIG',
+            f'Port={self.port_combo.currentText().strip() or "(none)"}, '
+            f'Baud={self.baud_combo.currentText()}, '
+            f'Data={self.data_bits_combo.currentText()}, '
+            f'Parity={self.parity_combo.currentText()}, '
+            f'Stop={self.stop_bits_combo.currentText()}, '
+            f'Flow={self.flow_combo.currentText()}, '
+            f'Ending={self.ending_combo.currentText()}'
+        )
+        self.session_status.setText(f'Logging: {self.log_path.name}')
+        self.start_session_btn.setEnabled(False)
+        self.stop_session_btn.setEnabled(True)
+
+    def stop_session(self):
+        if self.log_file is None:
+            return
+        self.log_event('SESSION', 'STOP')
+        path = self.log_path
+        self.log_file.close()
+        self.log_file = None
+        self.log_path = None
+        self.session_status.setText(f'Saved: {path}')
+        self.start_session_btn.setEnabled(True)
+        self.stop_session_btn.setEnabled(False)
+
     def refresh_ports(self):
         current=self.port_combo.currentText(); ports=[p.systemLocation() for p in QSerialPortInfo.availablePorts()]
         self.port_combo.blockSignals(True); self.port_combo.clear(); self.port_combo.addItems(ports)
@@ -69,40 +187,110 @@ class FPGAConsole(QMainWindow):
             else: self.port_combo.setEditText(current)
         self.port_combo.blockSignals(False)
 
+    def set_serial_controls_enabled(self, enabled):
+        self.port_combo.setEnabled(enabled)
+        self.baud_combo.setEnabled(enabled)
+        self.data_bits_combo.setEnabled(enabled)
+        self.parity_combo.setEnabled(enabled)
+        self.stop_bits_combo.setEnabled(enabled)
+        self.flow_combo.setEnabled(enabled)
+        self.refresh_btn.setEnabled(enabled)
+
+    def serial_config_text(self):
+        return (
+            f'{self.serial.portName()} @ {self.serial.baudRate()} '
+            f'{self.data_bits_combo.currentText()}-'
+            f'{self.parity_combo.currentText()}-'
+            f'{self.stop_bits_combo.currentText()}, '
+            f'Flow={self.flow_combo.currentText()}'
+        )
+
     def toggle_connection(self):
         if self.serial.isOpen():
-            self.serial.close(); self.connect_btn.setText('Connect'); self.status.setText('Disconnected'); return
+            self.log_event('SERIAL', f'DISCONNECT {self.serial_config_text()}')
+            self.serial.close()
+            self.connect_btn.setText('Connect')
+            self.status.setText('Disconnected')
+            self.set_serial_controls_enabled(True)
+            return
+
         port=self.port_combo.currentText().strip()
-        if not port: self.status.setText('Select a serial port'); return
-        self.serial.setPortName(port); self.serial.setBaudRate(int(self.baud_combo.currentText())); self.serial.setDataBits(QSerialPort.Data8); self.serial.setParity(QSerialPort.NoParity); self.serial.setStopBits(QSerialPort.OneStop); self.serial.setFlowControl(QSerialPort.NoFlowControl)
+        if not port:
+            self.status.setText('Select a serial port')
+            return
+
+        try:
+            baud = int(self.baud_combo.currentText())
+        except ValueError:
+            self.status.setText('Invalid baud rate')
+            return
+
+        self.serial.setPortName(port)
+        self.serial.setBaudRate(baud)
+        self.serial.setDataBits(self.data_bits_combo.currentData())
+        self.serial.setParity(self.parity_combo.currentData())
+        self.serial.setStopBits(self.stop_bits_combo.currentData())
+        self.serial.setFlowControl(self.flow_combo.currentData())
+
         if self.serial.open(QIODevice.ReadWrite):
-            self.connect_btn.setText('Disconnect'); self.status.setText(f'Connected: {port} @ {self.serial.baudRate()} 8-N-1')
-        else: self.status.setText(f'Open failed: {self.serial.errorString()}')
+            self.connect_btn.setText('Disconnect')
+            self.set_serial_controls_enabled(False)
+            config = self.serial_config_text()
+            self.status.setText(f'Connected: {config}')
+            self.log_event('SERIAL', f'CONNECT {config}')
+        else:
+            self.status.setText(f'Open failed: {self.serial.errorString()}')
+            self.log_event('ERROR', f'OPEN FAILED {port}: {self.serial.errorString()}')
 
     def read_serial(self):
         data=bytes(self.serial.readAll())
         if not data: return
-        self.raw_rx.appendPlainText(f'{self.timestamp()}  RX  [{len(data):3d}]  {hex_bytes(data)}')
+        raw = hex_bytes(data)
+        plain = printable_text(data)
+        self.raw_rx.appendPlainText(f'{self.timestamp()}  RX  [{len(data):3d}]  {raw}')
+        self.log_event('RX RAW', raw)
+        self.log_event('RX TEXT', plain)
         self.text_console.moveCursor(QTextCursor.MoveOperation.End)
-        self.text_console.insertPlainText(printable_text(data))
+        self.text_console.insertPlainText(plain)
         self.text_console.ensureCursorVisible()
     def send_text(self):
         if not self.serial.isOpen(): self.status.setText('Not connected'); return
         text=self.send_edit.text(); ending=self.ending_combo.currentData() or b''; payload=text.encode('ascii',errors='replace')+bytes(ending)
         written=self.serial.write(payload)
         if written<0: self.status.setText(f'Write failed: {self.serial.errorString()}'); return
-        self.raw_tx.appendPlainText(f'{self.timestamp()}  TX  [{len(payload):3d}]  {hex_bytes(payload)}')
+        raw = hex_bytes(payload)
+        stamp = self.timestamp()
+        self.raw_tx.appendPlainText(f'{stamp}  TX  [{len(payload):3d}]  {raw}')
+        self.command_history.addItem(f'{stamp}  {text}')
+        self.command_history.scrollToBottom()
+        self.log_event('TX RAW', raw)
+        self.log_event('TX TEXT', text)
         self.text_console.moveCursor(QTextCursor.MoveOperation.End)
         self.text_console.insertPlainText(f'>> {text}\n')
         self.text_console.ensureCursorVisible()
         self.send_edit.clear(); self.send_edit.setFocus()
 
     def serial_error(self,error):
-        if error!=QSerialPort.NoError and self.serial.isOpen(): self.status.setText(f'Serial error: {self.serial.errorString()}')
-    def clear_all(self): self.text_console.clear(); self.raw_rx.clear(); self.raw_tx.clear()
+        if error!=QSerialPort.NoError and self.serial.isOpen(): self.status.setText(f'Serial error: {self.serial.errorString()}'); self.log_event('ERROR', self.serial.errorString())
+    def clear_all(self): self.text_console.clear(); self.raw_rx.clear(); self.raw_tx.clear(); self.command_history.clear(); self.log_event('DISPLAY', 'CLEAR')
     def closeEvent(self,event):
-        if self.serial.isOpen(): self.serial.close()
+        if self.serial.isOpen():
+            self.log_event('SERIAL', f'DISCONNECT {self.serial_config_text()}')
+            self.serial.close()
+        self.stop_session()
         event.accept()
+def handle_sigint(signum, frame):
+    QApplication.quit()
 
-if __name__=='__main__':
-    app=QApplication(sys.argv); window=FPGAConsole(); window.show(); sys.exit(app.exec())
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    # Let Python periodically regain control so SIGINT (Ctrl+C) is handled.
+    sigint_timer = QTimer()
+    sigint_timer.start(100)
+    sigint_timer.timeout.connect(lambda: None)
+
+    window = FPGAConsole()
+    window.show()
+    sys.exit(app.exec())

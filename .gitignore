@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 *.pyproject.user
 .venv/
+Documents/
+logs/
 
