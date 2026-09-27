@@ -1,17 +1,107 @@
 #!/usr/bin/env python3
+"""
+FPGA UART Troubleshooting Console
+=================================
+
+Purpose
+-------
+This program provides a graphical UART terminal for communicating with an FPGA.
+
+The application can:
+    * Discover serial ports.
+    * Connect/disconnect from a selected UART port.
+    * Transmit ASCII commands to the FPGA.
+    * Display received FPGA data as plain text.
+    * Display raw TX/RX bytes in hexadecimal.
+    * Keep a command history.
+    * Save a timestamped communications log.
+
+Learning / safety-oriented coding style
+---------------------------------------
+This version is intentionally heavily commented so the control flow is easy
+to follow.
+
+It follows the *spirit* of the NASA/JPL "Power of Ten" rules where those ideas
+make sense in Python:
+    * Keep control flow simple.
+    * Avoid recursion.
+    * Keep functions reasonably small and focused.
+    * Validate inputs before using them.
+    * Check important return values.
+    * Keep side effects explicit.
+    * Prefer readable code over compressed one-line statements.
+
+Some original Power-of-Ten rules are specifically about C, pointers, memory
+allocation, and the C preprocessor, so they do not map directly to Python.
+
+IMPORTANT
+---------
+Version 1.1.0 preserves the existing UART behavior and adds graphical TX/RX
+activity LEDs.  The LEDs are display-only indicators and do not alter the UART
+protocol itself.
+"""
+
+# ---------------------------------------------------------------------------
+# Standard-library imports
+# ---------------------------------------------------------------------------
+# sys:
+#     Gives access to command-line arguments and the process exit function.
+#
+# signal:
+#     Lets Ctrl+C request that the Qt application shut down cleanly.
 import sys
 import signal
+# datetime:
+#     Used to create timestamps for the screen and session log files.
 from datetime import datetime
+
+# Path:
+#     Provides readable, cross-platform filesystem path handling.
 from pathlib import Path
+# ---------------------------------------------------------------------------
+# Qt / PySide6 imports
+# ---------------------------------------------------------------------------
+# QIODevice:
+#     Supplies the ReadWrite flag used when opening the serial port.
+#
+# QTimer:
+#     Used for two jobs:
+#       1. Refreshing the list of serial ports periodically.
+#       2. Giving Python periodic control so Ctrl+C can be handled.
 from PySide6.QtCore import QIODevice, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QApplication,QComboBox,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QLineEdit,QMainWindow,QPushButton,QPlainTextEdit,QSplitter,QVBoxLayout,QWidget,QListWidget
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
+# ---------------------------------------------------------------------------
+# Application version
+# ---------------------------------------------------------------------------
+# Version 1.1.0 adds graphical TX/RX activity indicators while preserving the
+# existing UART behavior.
+APP_VERSION = "1.1.0"
+
 def hex_bytes(data: bytes) -> str:
+    """Convert raw bytes into a human-readable hexadecimal string.
+
+    Example:
+        b'A\r\n'  ->  '41 0D 0A'
+
+    The UART still uses the original bytes.  This function only creates text
+    for display and logging.
+    """
     return ' '.join(f'{b:02X}' for b in data)
 
 def printable_text(data: bytes) -> str:
+    """Convert UART bytes into text that is safe to display.
+
+    Printable ASCII bytes are converted to characters.
+
+    Carriage return (0x0D) and line feed (0x0A) are preserved because they are
+    meaningful line-ending characters.
+
+    Any other non-printable byte is displayed in angle brackets, for example:
+        0x01 -> '<01>'
+    """
     out=[]
     for b in data:
         if b==0x0D: out.append('\r')
@@ -20,14 +110,34 @@ def printable_text(data: bytes) -> str:
         else: out.append(f'<{b:02X}>')
     return ''.join(out)
 
+# ---------------------------------------------------------------------------
+# Main application window
+# ---------------------------------------------------------------------------
 class FPGAConsole(QMainWindow):
+    """Main GUI window for the FPGA UART troubleshooting console."""
     def __init__(self):
+        """Create the window, serial-port object, timers, and user interface."""
+
+        # Initialize the QMainWindow base class first.
         super().__init__()
-        self.setWindowTitle('FPGA UART Troubleshooting Console')
+        self.setWindowTitle(f'FPGA UART Troubleshooting Console v{APP_VERSION}')
         self.resize(1200,800)
-        self.serial=QSerialPort(self)
+        # Create the Qt serial-port object.
+        #
+        # The two connect() calls below are Qt's signal/slot mechanism:
+        #   readyRead      -> call read_serial() when bytes arrive.
+        #   errorOccurred  -> call serial_error() when Qt reports a UART error.
+        self.serial = QSerialPort(self)
         self.serial.readyRead.connect(self.read_serial)
         self.serial.errorOccurred.connect(self.serial_error)
+
+        # TX/RX activity LEDs are visual indicators only.
+        #
+        # They do NOT control the serial port and they do NOT change the bytes
+        # being transmitted or received.  They simply flash briefly whenever
+        # this program sends or receives data.
+        self.tx_led = None
+        self.rx_led = None
 
         self.project_root = Path(__file__).resolve().parent.parent
         self.log_dir = Path.home() / 'Documents' / 'Logs'
@@ -40,6 +150,15 @@ class FPGAConsole(QMainWindow):
         self.port_timer=QTimer(self); self.port_timer.timeout.connect(self.refresh_ports); self.port_timer.start(2500)
 
     def build_ui(self):
+        """Create every visible control and place it into Qt layouts.
+
+        Unlike an Xcode storyboard, this application currently creates its
+        interface directly in Python code.
+
+        Qt layouts decide the final widget sizes and positions.  We describe
+        relationships such as 'put this widget in row 0, column 1' rather than
+        assigning fixed screen coordinates.
+        """
         central=QWidget(); self.setCentralWidget(central); root=QVBoxLayout(central)
         connection=QGroupBox('Serial Connection'); grid=QGridLayout(connection)
         grid.setHorizontalSpacing(6)
@@ -81,9 +200,31 @@ class FPGAConsole(QMainWindow):
         self.flow_combo.addItem('Software XON/XOFF', QSerialPort.SoftwareControl)
         self.flow_combo.setCurrentText('None')
 
-        self.connect_btn=QPushButton('Connect'); self.connect_btn.clicked.connect(self.toggle_connection)
-        self.refresh_btn=QPushButton('Refresh'); self.refresh_btn.clicked.connect(self.refresh_ports)
-        self.status=QLabel('Disconnected')
+        self.connect_btn = QPushButton('Connect')
+        self.connect_btn.clicked.connect(self.toggle_connection)
+
+        self.refresh_btn = QPushButton('Refresh')
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+
+        self.status = QLabel('Disconnected')
+
+        # -------------------------------------------------------------------
+        # UART activity indicators
+        # -------------------------------------------------------------------
+        # A QLabel can be styled to look like a small round LED.
+        #
+        # We start both indicators in their OFF state.  When data moves across
+        # the UART, flash_activity_led() temporarily changes the stylesheet to
+        # the ON state and then automatically returns it to OFF.
+        self.tx_led = QLabel()
+        self.rx_led = QLabel()
+
+        for led in (self.tx_led, self.rx_led):
+            led.setFixedSize(16, 16)
+            led.setStyleSheet(self.led_style(False))
+
+        self.tx_led.setToolTip('Flashes when the PC transmits data to the FPGA')
+        self.rx_led.setToolTip('Flashes when the PC receives data from the FPGA')
 
         grid.addWidget(QLabel('Port:'),0,0); grid.addWidget(self.port_combo,0,1)
         grid.addWidget(QLabel('Baud:'),0,2); grid.addWidget(self.baud_combo,0,3)
@@ -91,9 +232,27 @@ class FPGAConsole(QMainWindow):
         grid.addWidget(QLabel('Parity:'),1,0); grid.addWidget(self.parity_combo,1,1)
         grid.addWidget(QLabel('Stop Bits:'),1,2); grid.addWidget(self.stop_bits_combo,1,3)
         grid.addWidget(QLabel('Flow Control:'),1,4); grid.addWidget(self.flow_combo,1,5)
-        grid.addWidget(self.connect_btn,2,0,1,2)
-        grid.addWidget(self.refresh_btn,2,2,1,2)
-        grid.addWidget(self.status,2,4,1,2)
+        grid.addWidget(self.connect_btn, 2, 0, 1, 2)
+        grid.addWidget(self.refresh_btn, 2, 2, 1, 2)
+
+        # Put the activity indicators beside the connection status.
+        #
+        # Row 2, column 4 contains a small horizontal layout:
+        #     TX [LED]    RX [LED]    connection status text
+        activity_widget = QWidget()
+        activity_layout = QHBoxLayout(activity_widget)
+        activity_layout.setContentsMargins(0, 0, 0, 0)
+        activity_layout.setSpacing(6)
+
+        activity_layout.addWidget(QLabel('TX'))
+        activity_layout.addWidget(self.tx_led)
+        activity_layout.addSpacing(8)
+        activity_layout.addWidget(QLabel('RX'))
+        activity_layout.addWidget(self.rx_led)
+        activity_layout.addSpacing(12)
+        activity_layout.addWidget(self.status, 1)
+
+        grid.addWidget(activity_widget, 2, 4, 1, 2)
         root.addWidget(connection)
 
         session=QGroupBox('Session Logging'); session_layout=QHBoxLayout(session)
@@ -130,6 +289,51 @@ class FPGAConsole(QMainWindow):
         self.command_history=QListWidget()
         history_layout.addWidget(self.command_history)
         root.addWidget(history_group)
+
+    def led_style(self, is_on):
+        """Return the stylesheet used to draw an activity LED.
+
+        Parameters
+        ----------
+        is_on:
+            True  -> bright green LED.
+            False -> dark gray LED.
+
+        QLabel itself is rectangular, but border-radius: 8px turns the
+        16-by-16 label into a circle.
+        """
+        if is_on:
+            return (
+                'background-color: #32CD32;'
+                'border: 1px solid #1B7A1B;'
+                'border-radius: 8px;'
+            )
+
+        return (
+            'background-color: #3A3A3A;'
+            'border: 1px solid #707070;'
+            'border-radius: 8px;'
+        )
+
+    def flash_activity_led(self, led):
+        """Flash one UART activity LED for a short, visible interval.
+
+        The LED turns on immediately.
+
+        QTimer.singleShot() schedules a one-time callback 120 milliseconds
+        later.  That callback restores the LED to its OFF style.
+
+        This is non-blocking: the program does NOT sleep or pause while the
+        light is on, so serial communication and the GUI remain responsive.
+        """
+        led.setStyleSheet(self.led_style(True))
+
+        QTimer.singleShot(
+            120,
+            lambda target_led=led: target_led.setStyleSheet(
+                self.led_style(False)
+            ),
+        )
 
     def timestamp(self):
         return datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -243,8 +447,21 @@ class FPGAConsole(QMainWindow):
             self.log_event('ERROR', f'OPEN FAILED {port}: {self.serial.errorString()}')
 
     def read_serial(self):
-        data=bytes(self.serial.readAll())
-        if not data: return
+        """Handle bytes that arrive from the FPGA.
+
+        Qt calls this function automatically when QSerialPort emits its
+        readyRead signal.
+        """
+        data = bytes(self.serial.readAll())
+
+        # A readyRead signal can theoretically occur without useful bytes.
+        # Guard against that case before doing any display/log work.
+        if not data:
+            return
+
+        # Visible indication that bytes arrived from the FPGA.
+        self.flash_activity_led(self.rx_led)
+
         raw = hex_bytes(data)
         plain = printable_text(data)
         self.raw_rx.appendPlainText(f'{self.timestamp()}  RX  [{len(data):3d}]  {raw}')
@@ -254,10 +471,37 @@ class FPGAConsole(QMainWindow):
         self.text_console.insertPlainText(plain)
         self.text_console.ensureCursorVisible()
     def send_text(self):
-        if not self.serial.isOpen(): self.status.setText('Not connected'); return
-        text=self.send_edit.text(); ending=self.ending_combo.currentData() or b''; payload=text.encode('ascii',errors='replace')+bytes(ending)
-        written=self.serial.write(payload)
-        if written<0: self.status.setText(f'Write failed: {self.serial.errorString()}'); return
+        """Transmit the command currently entered by the user to the FPGA."""
+        # Do not attempt a write unless the UART is open.
+        if not self.serial.isOpen():
+            self.status.setText('Not connected')
+            return
+
+        # Read the user's command text and selected line ending.
+        text = self.send_edit.text()
+        ending = self.ending_combo.currentData() or b''
+
+        # UART data is sent as bytes.  Convert the entered ASCII text to bytes,
+        # then append the selected CR/LF ending bytes.
+        payload = (
+            text.encode('ascii', errors='replace')
+            + bytes(ending)
+        )
+
+        # Ask QSerialPort to queue the bytes for transmission.
+        written = self.serial.write(payload)
+
+        # Qt returns a negative value if the write could not be queued.
+        if written < 0:
+            self.status.setText(
+                f'Write failed: {self.serial.errorString()}'
+            )
+            return
+
+        # The bytes were accepted by QSerialPort for transmission.
+        # Flash the TX activity indicator.
+        self.flash_activity_led(self.tx_led)
+
         raw = hex_bytes(payload)
         stamp = self.timestamp()
         self.raw_tx.appendPlainText(f'{stamp}  TX  [{len(payload):3d}]  {raw}')
@@ -282,6 +526,12 @@ class FPGAConsole(QMainWindow):
 def handle_sigint(signum, frame):
     QApplication.quit()
 
+# ---------------------------------------------------------------------------
+# Program entry point
+# ---------------------------------------------------------------------------
+# Python sets __name__ to '__main__' when this file is launched directly.
+# This block is therefore the Python equivalent of the application's startup
+# entry point.
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     signal.signal(signal.SIGINT, handle_sigint)

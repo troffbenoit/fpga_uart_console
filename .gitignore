@@ -6,3 +6,7 @@ __pycache__/
 Documents/
 logs/
 
+
+build/
+dist/
+*.spec
