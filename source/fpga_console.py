@@ -36,9 +36,14 @@ allocation, and the C preprocessor, so they do not map directly to Python.
 
 IMPORTANT
 ---------
-Version 1.1.0 preserves the existing UART behavior and adds graphical TX/RX
-activity LEDs.  The LEDs are display-only indicators and do not alter the UART
-protocol itself.
+Version 1.2.0 preserves the existing UART behavior and adds a bounded,
+non-blocking memory-map self-test panel.  The tester sends known address
+commands and verifies the FPGA reply of the form:
+
+    ADDR=xxxx MAP=name
+
+The test panel does not replace physical probing of BR2 outputs; it verifies
+the FPGA parser and internal memory-map decode reported over UART.
 """
 
 # ---------------------------------------------------------------------------
@@ -51,6 +56,7 @@ protocol itself.
 #     Lets Ctrl+C request that the Qt application shut down cleanly.
 import sys
 import signal
+import re
 # datetime:
 #     Used to create timestamps for the screen and session log files.
 from datetime import datetime
@@ -70,15 +76,15 @@ from pathlib import Path
 #       2. Giving Python periodic control so Ctrl+C can be handled.
 from PySide6.QtCore import QIODevice, QTimer
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication,QComboBox,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QLineEdit,QMainWindow,QPushButton,QPlainTextEdit,QSplitter,QVBoxLayout,QWidget,QListWidget
+from PySide6.QtWidgets import QApplication,QComboBox,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QLineEdit,QMainWindow,QPushButton,QPlainTextEdit,QSplitter,QVBoxLayout,QWidget,QListWidget,QRadioButton,QButtonGroup
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 # ---------------------------------------------------------------------------
 # Application version
 # ---------------------------------------------------------------------------
-# Version 1.1.0 adds graphical TX/RX activity indicators while preserving the
-# existing UART behavior.
-APP_VERSION = "1.1.0"
+# Version 1.2.0 adds the automatic memory-map test panel while preserving
+# the existing serial terminal, logging, history, and activity indicators.
+APP_VERSION = "1.2.0"
 
 def hex_bytes(data: bytes) -> str:
     """Convert raw bytes into a human-readable hexadecimal string.
@@ -138,6 +144,28 @@ class FPGAConsole(QMainWindow):
         # this program sends or receives data.
         self.tx_led = None
         self.rx_led = None
+
+        # -------------------------------------------------------------------
+        # Automatic memory-map test state
+        # -------------------------------------------------------------------
+        # The test is deliberately bounded: at most four known test vectors
+        # are queued, one command is outstanding at a time, and every command
+        # has a finite timeout.  No recursion or blocking sleeps are used.
+        self.memory_map_tests = [
+            ('RAM',   '0000'),
+            ('ACIA',  '6000'),
+            ('UARTB', '7000'),
+            ('ROM',   '8000'),
+        ]
+        self.memory_test_queue = []
+        self.memory_test_current = None
+        self.memory_test_rx_buffer = ''
+        self.memory_test_results = []
+
+        self.memory_test_timer = QTimer(self)
+        self.memory_test_timer.setSingleShot(True)
+        self.memory_test_timer.setInterval(1500)
+        self.memory_test_timer.timeout.connect(self.memory_test_timeout)
 
         self.project_root = Path(__file__).resolve().parent.parent
         self.log_dir = Path.home() / 'Documents' / 'Logs'
@@ -283,6 +311,43 @@ class FPGAConsole(QMainWindow):
         self.clear_btn=QPushButton('Clear'); self.clear_btn.clicked.connect(self.clear_all)
         send_layout.addWidget(self.send_edit,1); send_layout.addWidget(QLabel('Ending:')); send_layout.addWidget(self.ending_combo); send_layout.addWidget(self.send_btn); send_layout.addWidget(self.clear_btn)
         root.addWidget(send_group)
+
+        # -------------------------------------------------------------------
+        # Memory Map Test
+        # -------------------------------------------------------------------
+        # Radio buttons select one known address region.  Run Selected tests
+        # only that vector.  Test All runs the four bounded vectors in order.
+        # Results are verified against the FPGA's ``MAP=`` reply.
+        memory_group = QGroupBox('Memory Map Test')
+        memory_layout = QHBoxLayout(memory_group)
+
+        self.memory_button_group = QButtonGroup(self)
+        self.memory_radio_buttons = {}
+
+        for index, (map_name, address) in enumerate(self.memory_map_tests):
+            label = f'{map_name}  ${address}'
+            radio = QRadioButton(label)
+            self.memory_button_group.addButton(radio, index)
+            self.memory_radio_buttons[map_name] = radio
+            memory_layout.addWidget(radio)
+
+        self.memory_radio_buttons['RAM'].setChecked(True)
+
+        self.memory_run_btn = QPushButton('Run Selected')
+        self.memory_run_btn.clicked.connect(self.run_selected_memory_test)
+
+        self.memory_all_btn = QPushButton('Test All')
+        self.memory_all_btn.clicked.connect(self.run_all_memory_tests)
+
+        self.memory_status = QLabel('Ready')
+        self.memory_status.setMinimumWidth(240)
+
+        memory_layout.addSpacing(12)
+        memory_layout.addWidget(self.memory_run_btn)
+        memory_layout.addWidget(self.memory_all_btn)
+        memory_layout.addSpacing(12)
+        memory_layout.addWidget(self.memory_status, 1)
+        root.addWidget(memory_group)
 
         history_group=QGroupBox('Command History')
         history_layout=QVBoxLayout(history_group)
@@ -462,6 +527,10 @@ class FPGAConsole(QMainWindow):
         # Visible indication that bytes arrived from the FPGA.
         self.flash_activity_led(self.rx_led)
 
+        # Feed the same received bytes to the optional automatic memory-map
+        # checker.  The checker only acts while a test command is outstanding.
+        self.process_memory_test_rx(data)
+
         raw = hex_bytes(data)
         plain = printable_text(data)
         self.raw_rx.appendPlainText(f'{self.timestamp()}  RX  [{len(data):3d}]  {raw}')
@@ -513,6 +582,173 @@ class FPGAConsole(QMainWindow):
         self.text_console.insertPlainText(f'>> {text}\n')
         self.text_console.ensureCursorVisible()
         self.send_edit.clear(); self.send_edit.setFocus()
+
+    def set_memory_test_controls_enabled(self, enabled):
+        """Enable or disable controls that can start a new map test."""
+        self.memory_run_btn.setEnabled(enabled)
+        self.memory_all_btn.setEnabled(enabled)
+        for radio in self.memory_radio_buttons.values():
+            radio.setEnabled(enabled)
+
+    def run_selected_memory_test(self):
+        """Run exactly one selected memory-map test vector."""
+        if not self.serial.isOpen():
+            self.memory_status.setText('FAIL — serial port is not connected')
+            return
+
+        selected = None
+        for test in self.memory_map_tests:
+            map_name, _address = test
+            if self.memory_radio_buttons[map_name].isChecked():
+                selected = test
+                break
+
+        if selected is None:
+            self.memory_status.setText('Select a memory region')
+            return
+
+        self.start_memory_test_sequence([selected])
+
+    def run_all_memory_tests(self):
+        """Run all four known memory-map vectors in a fixed order."""
+        if not self.serial.isOpen():
+            self.memory_status.setText('FAIL — serial port is not connected')
+            return
+
+        # Copy the fixed list so the master definition is never mutated.
+        self.start_memory_test_sequence(list(self.memory_map_tests))
+
+    def start_memory_test_sequence(self, tests):
+        """Initialize one bounded memory-map test sequence."""
+        if self.memory_test_current is not None:
+            self.memory_status.setText('Test already running')
+            return
+
+        # Defensive bound: the GUI only defines four valid vectors.
+        if not tests or len(tests) > len(self.memory_map_tests):
+            self.memory_status.setText('Invalid test request')
+            return
+
+        self.memory_test_queue = list(tests)
+        self.memory_test_results = []
+        self.memory_test_rx_buffer = ''
+        self.set_memory_test_controls_enabled(False)
+        self.start_next_memory_test()
+
+    def start_next_memory_test(self):
+        """Transmit the next queued test vector or finish the sequence."""
+        if not self.memory_test_queue:
+            passed = sum(1 for result in self.memory_test_results if result)
+            total = len(self.memory_test_results)
+            self.memory_status.setText(f'PASS — {passed}/{total} memory-map tests')
+            self.memory_test_current = None
+            self.set_memory_test_controls_enabled(True)
+            return
+
+        map_name, address = self.memory_test_queue.pop(0)
+        self.memory_test_current = (map_name, address)
+        self.memory_test_rx_buffer = ''
+        self.memory_status.setText(f'Testing {map_name} ${address} ...')
+
+        # The FPGA parser already accepts the same Axxxx + CR/LF framing used
+        # by the manual console.  Keep the automated path explicit and fixed.
+        command = f'A{address}'
+        payload = command.encode('ascii') + b'\r\n'
+        written = self.serial.write(payload)
+
+        if written < 0:
+            self.fail_memory_test(
+                f'write failed: {self.serial.errorString()}'
+            )
+            return
+
+        self.flash_activity_led(self.tx_led)
+        stamp = self.timestamp()
+        raw = hex_bytes(payload)
+        self.raw_tx.appendPlainText(
+            f'{stamp}  TX  [{len(payload):3d}]  {raw}'
+        )
+        self.command_history.addItem(f'{stamp}  {command}  [AUTO MAP TEST]')
+        self.command_history.scrollToBottom()
+        self.log_event('TX RAW', raw)
+        self.log_event('TX TEXT', f'{command} [AUTO MAP TEST]')
+        self.text_console.moveCursor(QTextCursor.MoveOperation.End)
+        self.text_console.insertPlainText(f'>> {command}  [AUTO]\n')
+        self.text_console.ensureCursorVisible()
+
+        self.memory_test_timer.start()
+
+    def process_memory_test_rx(self, data):
+        """Parse FPGA memory-map replies while an automatic test is active.
+
+        Expected reply example::
+
+            ADDR=6000 MAP=ACIA\r\n
+
+        Serial callbacks may split one line across multiple reads, so incoming
+        text is accumulated in a bounded buffer until a complete match appears.
+        """
+        if self.memory_test_current is None:
+            return
+
+        chunk = data.decode('ascii', errors='ignore')
+        self.memory_test_rx_buffer += chunk
+
+        # The expected line is short.  Cap the accumulator so malformed or
+        # unrelated traffic cannot grow memory without bound.
+        if len(self.memory_test_rx_buffer) > 256:
+            self.memory_test_rx_buffer = self.memory_test_rx_buffer[-256:]
+
+        match = re.search(
+            r'ADDR=([0-9A-Fa-f]{4})\s+MAP=([A-Za-z]+)',
+            self.memory_test_rx_buffer,
+        )
+        if match is None:
+            return
+
+        self.memory_test_timer.stop()
+
+        actual_address = match.group(1).upper()
+        actual_map = match.group(2).upper()
+        expected_map, expected_address = self.memory_test_current
+
+        if actual_address != expected_address or actual_map != expected_map:
+            self.fail_memory_test(
+                f'expected {expected_address}/{expected_map}, '
+                f'got {actual_address}/{actual_map}'
+            )
+            return
+
+        self.memory_test_results.append(True)
+        self.log_event(
+            'MAP TEST',
+            f'PASS ADDR={actual_address} MAP={actual_map}',
+        )
+        self.memory_status.setText(
+            f'PASS {expected_map} ${expected_address}'
+        )
+        self.memory_test_current = None
+
+        # Schedule the next vector after Qt returns to its event loop.  This
+        # avoids recursion and keeps serial/UI processing non-blocking.
+        QTimer.singleShot(100, self.start_next_memory_test)
+
+    def memory_test_timeout(self):
+        """Fail the current vector if no valid FPGA reply arrived in time."""
+        if self.memory_test_current is None:
+            return
+        map_name, address = self.memory_test_current
+        self.fail_memory_test(f'timeout waiting for {map_name} ${address}')
+
+    def fail_memory_test(self, reason):
+        """Stop the active test sequence on the first deterministic failure."""
+        self.memory_test_timer.stop()
+        self.memory_test_results.append(False)
+        self.memory_test_queue = []
+        self.memory_test_current = None
+        self.memory_status.setText(f'FAIL — {reason}')
+        self.log_event('MAP TEST', f'FAIL {reason}')
+        self.set_memory_test_controls_enabled(True)
 
     def serial_error(self,error):
         if error!=QSerialPort.NoError and self.serial.isOpen(): self.status.setText(f'Serial error: {self.serial.errorString()}'); self.log_event('ERROR', self.serial.errorString())
